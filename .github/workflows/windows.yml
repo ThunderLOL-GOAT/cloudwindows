@@ -1,0 +1,116 @@
+name: Temporary Windows Desktop
+
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  windows-desktop:
+    runs-on: windows-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: Restore previous Minecraft and Lunar files
+        uses: dawidd6/action-download-artifact@v6
+        continue-on-error: true
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          workflow: windows.yml
+          name: minecraft-backup
+          path: C:/Users/runneradmin/desktop-backup
+          if_no_artifact_found: ignore
+
+      - name: Extract previous backup
+        shell: pwsh
+        run: |
+          $backup = 'C:\Users\runneradmin\desktop-backup\desktop-backup.zip'
+          if (Test-Path $backup) {
+            Expand-Archive -LiteralPath $backup -DestinationPath $env:USERPROFILE -Force
+            Write-Host 'Previous game files restored.'
+          } else {
+            Write-Host 'No previous backup found; starting with a clean profile.'
+          }
+
+      - name: Connect this runner to Tailscale
+        uses: tailscale/github-action@v3
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+          hostname: windows-cloud-runner
+
+      - name: Enable secure RDP access
+        shell: pwsh
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+            throw 'RDP_PASSWORD secret is missing.'
+          }
+
+          net user runneradmin $env:RDP_PASSWORD
+          if ($LASTEXITCODE -ne 0) { throw 'Could not set the RDP password.' }
+
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name UserAuthentication -Value 1
+          Set-Service -Name TermService -StartupType Automatic
+          Start-Service -Name TermService
+
+          Get-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue |
+            Set-NetFirewallRule -Enabled True -Profile Any -RemoteAddress '100.64.0.0/10'
+
+          $ip = (tailscale ip -4 | Select-Object -First 1).Trim()
+          if (-not $ip) { throw 'Could not determine the Tailscale IPv4 address.' }
+          Write-Host "Tailscale IPv4: $ip"
+          Write-Host 'Connect using your RDP app to the Tailscale IP above, username runneradmin, and your saved RDP_PASSWORD.'
+
+      - name: Keep desktop session available
+        shell: pwsh
+        run: |
+          Write-Host 'Desktop is ready. The job has a maximum duration of 350 minutes.'
+          while ($true) {
+            Start-Sleep -Seconds 30
+          }
+
+      - name: Package Minecraft and Lunar data for the next run
+        if: always()
+        shell: pwsh
+        run: |
+          $root = $env:USERPROFILE
+          $stage = Join-Path $env:TEMP 'desktop-backup-stage'
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+
+          $paths = @(
+            (Join-Path $root 'AppData\Roaming\.minecraft'),
+            (Join-Path $root '.lunarclient'),
+            (Join-Path $root 'AppData\Roaming\lunarclient')
+          )
+
+          foreach ($source in $paths) {
+            if (Test-Path $source) {
+              $relative = $source.Substring($root.Length).TrimStart('\')
+              $destination = Join-Path $stage $relative
+              New-Item -ItemType Directory -Force -Path (Split-Path $destination) | Out-Null
+              Copy-Item -LiteralPath $source -Destination $destination -Recurse -Force
+            }
+          }
+
+          $zip = Join-Path $env:RUNNER_TEMP 'desktop-backup.zip'
+          if (Test-Path $zip) { Remove-Item $zip -Force }
+          if ((Get-ChildItem $stage -Force | Measure-Object).Count -gt 0) {
+            Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zip -Force
+            New-Item -ItemType Directory -Force -Path (Join-Path $env:RUNNER_TEMP 'desktop-backup') | Out-Null
+            Move-Item -LiteralPath $zip -Destination (Join-Path $env:RUNNER_TEMP 'desktop-backup\desktop-backup.zip') -Force
+          } else {
+            Write-Host 'No Minecraft or Lunar files found to back up.'
+          }
+
+      - name: Save backup artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: minecraft-backup
+          path: ${{ runner.temp }}/desktop-backup/desktop-backup.zip
+          if-no-files-found: ignore
+          retention-days: 30
