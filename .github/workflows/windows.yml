@@ -92,39 +92,68 @@ jobs:
             throw "Sunshine installer failed with exit code $($process.ExitCode)."
           }
 
-          $tsIp = (tailscale ip -4 | Select-Object -First 1).Trim()
-          if (-not $tsIp) { throw 'Could not determine Tailscale IP for Sunshine CSRF configuration.' }
+          $ipOutput = tailscale ip -4 2>$null
+          if ($LASTEXITCODE -ne 0 -or -not $ipOutput) { throw 'Tailscale is not connected; refusing to configure Sunshine.' }
+          $tsIp = ($ipOutput | Select-Object -First 1).ToString().Trim()
+          if (-not $tsIp) { throw 'Could not determine Tailscale IP for Sunshine configuration.' }
 
           $configDir = Join-Path $env:ProgramFiles 'Sunshine\config'
           $sunshineConfig = Join-Path $configDir 'sunshine.conf'
           New-Item -ItemType Directory -Force -Path $configDir | Out-Null
 
-          $origin = "https://$tsIp"
           $configLines = if (Test-Path -LiteralPath $sunshineConfig) {
             @(Get-Content -LiteralPath $sunshineConfig)
           } else {
             @()
           }
 
-          $settingIndex = -1
-          for ($i = 0; $i -lt $configLines.Count; $i++) {
-            if ([string]$configLines[$i] -match '^\s*csrf_allowed_origins\s*=') {
-              $settingIndex = $i
-              break
+          function Set-SunshineSetting {
+            param([string]$Name, [string]$Value)
+            $pattern = '^\s*' + [regex]::Escape($Name) + '\s*='
+            $index = -1
+            for ($i = 0; $i -lt $script:configLines.Count; $i++) {
+              if ([string]$script:configLines[$i] -match $pattern) {
+                $index = $i
+                break
+              }
+            }
+            $line = "$Name = $Value"
+            if ($index -ge 0) {
+              $script:configLines[$index] = $line
+            } else {
+              $script:configLines += $line
             }
           }
 
-          if ($settingIndex -ge 0) {
-            $existingValue = ([string]$configLines[$settingIndex] -replace '^\s*csrf_allowed_origins\s*=\s*', '')
+          # Sunshine receives the browser Origin with the Web UI port included.
+          # Keep the exact HTTPS origin allowed so the Web UI does not hit CSRF errors.
+          $origin = "https://$tsIp:47990"
+          $csrfIndex = -1
+          for ($i = 0; $i -lt $configLines.Count; $i++) {
+            if ([string]$configLines[$i] -match '^\s*csrf_allowed_origins\s*=') {
+              $csrfIndex = $i
+              break
+            }
+          }
+          if ($csrfIndex -ge 0) {
+            $existingValue = ([string]$configLines[$csrfIndex] -replace '^\s*csrf_allowed_origins\s*=\s*', '')
             $origins = @($existingValue -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
             if ($origins -notcontains $origin) { $origins += $origin }
-            $configLines[$settingIndex] = "csrf_allowed_origins = $($origins -join ',')"
+            $configLines[$csrfIndex] = "csrf_allowed_origins = $($origins -join ',')"
           } else {
             $configLines += "csrf_allowed_origins = $origin"
           }
 
+          # Reduce idle/static-screen traffic while retaining a strict stream ceiling.
+          Set-SunshineSetting -Name 'minimum_fps_target' -Value '1'
+          Set-SunshineSetting -Name 'max_bitrate' -Value '750'
+          Set-SunshineSetting -Name 'max_stream_resolution' -Value '854x480'
+
           Set-Content -LiteralPath $sunshineConfig -Value $configLines -Encoding utf8
           Write-Host "Configured Sunshine CSRF origin: $origin"
+          Write-Host 'Configured static-content minimum FPS target: 1'
+          Write-Host 'Configured maximum stream bitrate: 750 Kbps'
+          Write-Host 'Configured maximum stream resolution: 854x480'
 
           $service = Get-Service -Name 'SunshineService' -ErrorAction SilentlyContinue
           if (-not $service) {
