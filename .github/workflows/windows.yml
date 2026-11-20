@@ -65,6 +65,36 @@ jobs:
           Write-Host "Tailscale IPv4: $ip"
           Write-Host 'Connect using your RDP app to the Tailscale IP above, username runneradmin, and your saved RDP_PASSWORD.'
 
+      - name: Install and configure Sunshine for Moonlight
+        shell: pwsh
+        run: |
+          $installer = Join-Path $env:TEMP 'Sunshine-Windows-AMD64-installer.msi'
+          $url = 'https://github.com/LizardByte/Sunshine/releases/latest/download/Sunshine-Windows-AMD64-installer.msi'
+          Invoke-WebRequest -Uri $url -OutFile $installer
+          $process = Start-Process msiexec.exe -ArgumentList @('/i', $installer, '/qn', '/norestart') -Wait -PassThru
+          if ($process.ExitCode -notin @(0, 3010)) {
+            throw "Sunshine installer failed with exit code $($process.ExitCode)."
+          }
+
+          $service = Get-Service -Name SunshineService -ErrorAction SilentlyContinue
+          if (-not $service) {
+            $service = Get-Service | Where-Object { $_.DisplayName -like '*Sunshine*' } | Select-Object -First 1
+          }
+          if ($service) {
+            Set-Service -Name $service.Name -StartupType Automatic
+            Start-Service -Name $service.Name -ErrorAction SilentlyContinue
+            Write-Host "Sunshine service: $($service.Name) ($((Get-Service -Name $service.Name).Status))"
+          } else {
+            Write-Host 'Sunshine installed; service was not detected. Check the Sunshine tray app after connecting.'
+          }
+
+          $tcpPorts = '47984,47989,47990,48010'
+          $udpPorts = '47998-48000,48010'
+          New-NetFirewallRule -DisplayName 'Sunshine TCP via Tailscale' -Direction Inbound -Action Allow -Protocol TCP -LocalPort $tcpPorts -RemoteAddress '100.64.0.0/10' -Profile Any -ErrorAction SilentlyContinue | Out-Null
+          New-NetFirewallRule -DisplayName 'Sunshine UDP via Tailscale' -Direction Inbound -Action Allow -Protocol UDP -LocalPort $udpPorts -RemoteAddress '100.64.0.0/10' -Profile Any -ErrorAction SilentlyContinue | Out-Null
+          Write-Host 'Sunshine firewall access restricted to Tailscale addresses.'
+          Write-Host 'After connecting by RDP, open https://localhost:47990 to create Sunshine credentials and pair Moonlight.'
+
       - name: Keep desktop session available
         shell: pwsh
         run: |
