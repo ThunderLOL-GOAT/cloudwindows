@@ -128,9 +128,9 @@ jobs:
             }
           }
 
-          # Sunshine receives the browser Origin with the Web UI port included.
-          # Keep the exact HTTPS origin allowed so the Web UI does not hit CSRF errors.
-          $origin = "https://$tsIp:47990"
+          # Add both the bare HTTPS origin and explicit Web UI port. Browsers
+          # normally send the port, while Sunshine accepts URL-prefix entries.
+          $originsToAllow = @("https://$tsIp", "https://$tsIp:47990")
           $csrfIndex = -1
           for ($i = 0; $i -lt $configLines.Count; $i++) {
             if ([string]$configLines[$i] -match '^\s*csrf_allowed_origins\s*=') {
@@ -138,13 +138,18 @@ jobs:
               break
             }
           }
+          $origins = @()
           if ($csrfIndex -ge 0) {
             $existingValue = ([string]$configLines[$csrfIndex] -replace '^\s*csrf_allowed_origins\s*=\s*', '')
             $origins = @($existingValue -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-            if ($origins -notcontains $origin) { $origins += $origin }
+          }
+          foreach ($allowedOrigin in $originsToAllow) {
+            if ($origins -notcontains $allowedOrigin) { $origins += $allowedOrigin }
+          }
+          if ($csrfIndex -ge 0) {
             $configLines[$csrfIndex] = "csrf_allowed_origins = $($origins -join ',')"
           } else {
-            $configLines += "csrf_allowed_origins = $origin"
+            $configLines += "csrf_allowed_origins = $($origins -join ',')"
           }
 
           # Reduce idle/static-screen traffic while retaining a strict stream ceiling.
@@ -153,7 +158,7 @@ jobs:
           Set-SunshineSetting -Name 'max_stream_resolution' -Value '854x480'
 
           Set-Content -LiteralPath $sunshineConfig -Value $configLines -Encoding utf8
-          Write-Host "Configured Sunshine CSRF origin: $origin"
+          Write-Host "Configured Sunshine CSRF origins: $($origins -join ', ')"
           Write-Host 'Configured static-content minimum FPS target: 1'
           Write-Host 'Configured maximum stream bitrate: 750 Kbps'
           Write-Host 'Configured maximum stream resolution: 854x480'
