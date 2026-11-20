@@ -20,7 +20,7 @@ jobs:
         uses: dawidd6/action-download-artifact@v6
         continue-on-error: true
         with:
-          github_token: \${{ secrets.GITHUB_TOKEN }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
           workflow: windows.yml
           name: minecraft-backup
           path: C:/Users/runneradmin/desktop-backup
@@ -40,13 +40,24 @@ jobs:
       - name: Connect this runner to Tailscale
         uses: tailscale/github-action@v3
         with:
-          authkey: \${{ secrets.TAILSCALE_AUTHKEY }}
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
           hostname: windows-cloud-runner
+
+      - name: Verify Tailscale connection
+        shell: pwsh
+        run: |
+          $ipOutput = tailscale ip -4 2>$null
+          if ($LASTEXITCODE -ne 0 -or -not $ipOutput) {
+            throw 'Tailscale did not authenticate or obtain an IP. Check the TAILSCALE_AUTHKEY repository secret; generate a fresh reusable auth key in the Tailscale admin console and update the secret. Do not paste the key into chat.'
+          }
+          $ip = ($ipOutput | Select-Object -First 1).ToString().Trim()
+          if (-not $ip) { throw 'Tailscale returned an empty IPv4 address.' }
+          Write-Host "Tailscale verified: $ip"
 
       - name: Enable secure RDP access
         shell: pwsh
         env:
-          RDP_PASSWORD: \${{ secrets.RDP_PASSWORD }}
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
           if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
             throw 'RDP_PASSWORD secret is missing.'
@@ -63,7 +74,9 @@ jobs:
           Get-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue |
             Set-NetFirewallRule -Enabled True -Profile Any -RemoteAddress '100.64.0.0/10'
 
-          $ip = (tailscale ip -4 | Select-Object -First 1).Trim()
+          $ipOutput = tailscale ip -4 2>$null
+          if ($LASTEXITCODE -ne 0 -or -not $ipOutput) { throw 'Tailscale is not connected; refusing to continue with RDP setup.' }
+          $ip = ($ipOutput | Select-Object -First 1).ToString().Trim()
           if (-not $ip) { throw 'Could not determine the Tailscale IPv4 address.' }
           Write-Host "Tailscale IPv4: $ip"
           Write-Host 'Connect using your RDP app to the Tailscale IP above, username runneradmin, and your saved RDP_PASSWORD.'
@@ -185,6 +198,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: minecraft-backup
-          path: \${{ runner.temp }}/desktop-backup/desktop-backup.zip
+          path: ${{ runner.temp }}/desktop-backup/desktop-backup.zip
           if-no-files-found: ignore
           retention-days: 30
