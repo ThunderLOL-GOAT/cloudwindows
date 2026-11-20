@@ -2,6 +2,9 @@ name: Temporary Windows Desktop
 
 on:
   workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/windows.yml'
 
 permissions:
   actions: read
@@ -17,7 +20,7 @@ jobs:
         uses: dawidd6/action-download-artifact@v6
         continue-on-error: true
         with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
+          github_token: \${{ secrets.GITHUB_TOKEN }}
           workflow: windows.yml
           name: minecraft-backup
           path: C:/Users/runneradmin/desktop-backup
@@ -37,13 +40,13 @@ jobs:
       - name: Connect this runner to Tailscale
         uses: tailscale/github-action@v3
         with:
-          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+          authkey: \${{ secrets.TAILSCALE_AUTHKEY }}
           hostname: windows-cloud-runner
 
       - name: Enable secure RDP access
         shell: pwsh
         env:
-          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+          RDP_PASSWORD: \${{ secrets.RDP_PASSWORD }}
         run: |
           if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
             throw 'RDP_PASSWORD secret is missing.'
@@ -76,96 +79,65 @@ jobs:
             throw "Sunshine installer failed with exit code $($process.ExitCode)."
           }
 
-          $sunshineConfig = Join-Path $env:ProgramFiles 'Sunshine\config\sunshine.conf'
           $tsIp = (tailscale ip -4 | Select-Object -First 1).Trim()
           if (-not $tsIp) { throw 'Could not determine Tailscale IP for Sunshine CSRF configuration.' }
-          New-Item -ItemType Directory -Force -Path (Split-Path $sunshineConfig) | Out-Null
+
+          $configDir = Join-Path $env:ProgramFiles 'Sunshine\config'
+          $sunshineConfig = Join-Path $configDir 'sunshine.conf'
+          New-Item -ItemType Directory -Force -Path $configDir | Out-Null
+
           $origin = "https://$tsIp"
-          $configText = if (Test-Path $sunshineConfig) { Get-Content -LiteralPath $sunshineConfig -Raw } else { '' }
-          if ($configText -match '(?m)^\s*csrf_allowed_origins\s*=') {
-            $configText = [regex]::Replace($configText, '(?m)^\s*csrf_allowed_origins\s*=.*
-
-          $tcpPorts = '47984,47989,47990,48010'
-          $udpPorts = '47998-48000,48010'
-          New-NetFirewallRule -DisplayName 'Sunshine TCP via Tailscale' -Direction Inbound -Action Allow -Protocol TCP -LocalPort $tcpPorts -RemoteAddress '100.64.0.0/10' -Profile Any -ErrorAction SilentlyContinue | Out-Null
-          New-NetFirewallRule -DisplayName 'Sunshine UDP via Tailscale' -Direction Inbound -Action Allow -Protocol UDP -LocalPort $udpPorts -RemoteAddress '100.64.0.0/10' -Profile Any -ErrorAction SilentlyContinue | Out-Null
-          Write-Host 'Sunshine firewall access restricted to Tailscale addresses.'
-          Write-Host 'After connecting by RDP, open https://localhost:47990 to create Sunshine credentials and pair Moonlight.'
-
-      - name: Keep desktop session available
-        shell: pwsh
-        run: |
-          Write-Host 'Desktop is ready. The job has a maximum duration of 350 minutes.'
-          while ($true) {
-            Start-Sleep -Seconds 30
+          $configLines = if (Test-Path -LiteralPath $sunshineConfig) {
+            @(Get-Content -LiteralPath $sunshineConfig)
+          } else {
+            @()
           }
 
-      - name: Package Minecraft and Lunar data for the next run
-        if: always()
-        shell: pwsh
-        run: |
-          $root = $env:USERPROFILE
-          $stage = Join-Path $env:TEMP 'desktop-backup-stage'
-          New-Item -ItemType Directory -Force -Path $stage | Out-Null
-
-          $paths = @(
-            (Join-Path $root 'AppData\Roaming\.minecraft'),
-            (Join-Path $root '.lunarclient'),
-            (Join-Path $root 'AppData\Roaming\lunarclient')
-          )
-
-          foreach ($source in $paths) {
-            if (Test-Path $source) {
-              $relative = $source.Substring($root.Length).TrimStart('\')
-              $destination = Join-Path $stage $relative
-              New-Item -ItemType Directory -Force -Path (Split-Path $destination) | Out-Null
-              Copy-Item -LiteralPath $source -Destination $destination -Recurse -Force
+          $settingIndex = -1
+          for ($i = 0; $i -lt $configLines.Count; $i++) {
+            if ([string]$configLines[$i] -match '^\s*csrf_allowed_origins\s*=') {
+              $settingIndex = $i
+              break
             }
           }
 
-          $zip = Join-Path $env:RUNNER_TEMP 'desktop-backup.zip'
-          if (Test-Path $zip) { Remove-Item $zip -Force }
-          if ((Get-ChildItem $stage -Force | Measure-Object).Count -gt 0) {
-            Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zip -Force
-            New-Item -ItemType Directory -Force -Path (Join-Path $env:RUNNER_TEMP 'desktop-backup') | Out-Null
-            Move-Item -LiteralPath $zip -Destination (Join-Path $env:RUNNER_TEMP 'desktop-backup\desktop-backup.zip') -Force
+          if ($settingIndex -ge 0) {
+            $existingValue = ([string]$configLines[$settingIndex] -replace '^\s*csrf_allowed_origins\s*=\s*', '')
+            $origins = @($existingValue -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+            if ($origins -notcontains $origin) { $origins += $origin }
+            $configLines[$settingIndex] = "csrf_allowed_origins = $($origins -join ',')"
           } else {
-            Write-Host 'No Minecraft or Lunar files found to back up.'
+            $configLines += "csrf_allowed_origins = $origin"
           }
 
-      - name: Save backup artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: minecraft-backup
-          path: ${{ runner.temp }}/desktop-backup/desktop-backup.zip
-          if-no-files-found: ignore
-          retention-days: 30
-, "csrf_allowed_origins = $origin")
-          } else {
-            $configText = $configText.TrimEnd() + "`r`ncsrf_allowed_origins = $origin`r`n"
-          }
-          Set-Content -LiteralPath $sunshineConfig -Value $configText -Encoding UTF8
-          Write-Host "Added Sunshine CSRF origin: $origin"
+          Set-Content -LiteralPath $sunshineConfig -Value $configLines -Encoding utf8
+          Write-Host "Configured Sunshine CSRF origin: $origin"
 
-          $service = Get-Service -Name SunshineService -ErrorAction SilentlyContinue
+          $service = Get-Service -Name 'SunshineService' -ErrorAction SilentlyContinue
           if (-not $service) {
-            $service = Get-Service | Where-Object { $_.DisplayName -like '*Sunshine*' } | Select-Object -First 1
+            $service = Get-Service | Where-Object {
+              $_.Name -like '*Sunshine*' -or $_.DisplayName -like '*Sunshine*'
+            } | Select-Object -First 1
           }
-          if ($service) {
-            Set-Service -Name $service.Name -StartupType Automatic
-            Start-Service -Name $service.Name -ErrorAction SilentlyContinue
-            Write-Host "Sunshine service: $($service.Name) ($((Get-Service -Name $service.Name).Status))"
+          if (-not $service) { throw 'Sunshine was installed, but its Windows service was not found.' }
+
+          Set-Service -Name $service.Name -StartupType Automatic
+          if ($service.Status -eq 'Running') {
+            Restart-Service -Name $service.Name -Force -ErrorAction Stop
           } else {
-            Write-Host 'Sunshine installed; service was not detected. Check the Sunshine tray app after connecting.'
+            Start-Service -Name $service.Name -ErrorAction Stop
           }
+          Start-Sleep -Seconds 3
+          $service = Get-Service -Name $service.Name
+          Write-Host "Sunshine service: $($service.Name) ($($service.Status))"
+          if ($service.Status -ne 'Running') { throw 'Sunshine service did not start.' }
 
           $tcpPorts = '47984,47989,47990,48010'
           $udpPorts = '47998-48000,48010'
           New-NetFirewallRule -DisplayName 'Sunshine TCP via Tailscale' -Direction Inbound -Action Allow -Protocol TCP -LocalPort $tcpPorts -RemoteAddress '100.64.0.0/10' -Profile Any -ErrorAction SilentlyContinue | Out-Null
           New-NetFirewallRule -DisplayName 'Sunshine UDP via Tailscale' -Direction Inbound -Action Allow -Protocol UDP -LocalPort $udpPorts -RemoteAddress '100.64.0.0/10' -Profile Any -ErrorAction SilentlyContinue | Out-Null
           Write-Host 'Sunshine firewall access restricted to Tailscale addresses.'
-          Write-Host 'After connecting by RDP, open https://localhost:47990 to create Sunshine credentials and pair Moonlight.'
+          Write-Host 'Open https://<current-tailscale-ip>:47990 to create Sunshine credentials and pair Moonlight.'
 
       - name: Keep desktop session available
         shell: pwsh
@@ -213,6 +185,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: minecraft-backup
-          path: ${{ runner.temp }}/desktop-backup/desktop-backup.zip
+          path: \${{ runner.temp }}/desktop-backup/desktop-backup.zip
           if-no-files-found: ignore
           retention-days: 30
