@@ -52,7 +52,506 @@ jobs:
           }
           $ip = ($ipOutput | Select-Object -First 1).ToString().Trim()
           if (-not $ip) { throw 'Tailscale returned an empty IPv4 address.' }
-          Write-Host "Tailscale verified: $ip"
+          if ($ip -notmatch '^\d{1,3}(\.\d{1,3}){3}
+
+      - name: Enable secure RDP access
+        shell: pwsh
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+            throw 'RDP_PASSWORD secret is missing.'
+          }
+
+          net user runneradmin $env:RDP_PASSWORD
+          if ($LASTEXITCODE -ne 0) { throw 'Could not set the RDP password.' }
+
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name UserAuthentication -Value 1
+          Set-Service -Name TermService -StartupType Automatic
+          Start-Service -Name TermService
+
+          Get-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue |
+            Set-NetFirewallRule -Enabled True -Profile Any -RemoteAddress '100.64.0.0/10'
+
+          $ipOutput = tailscale ip -4 2>$null
+          if ($LASTEXITCODE -ne 0 -or -not $ipOutput) { throw 'Tailscale is not connected; refusing to continue with RDP setup.' }
+          $ip = ($ipOutput | Select-Object -First 1).ToString().Trim()
+          if (-not $ip) { throw 'Could not determine the Tailscale IPv4 address.' }
+          Write-Host "Tailscale IPv4: $ip"
+          Write-Host 'Connect using your RDP app to the Tailscale IP above, username runneradmin, and your saved RDP_PASSWORD.'
+
+      - name: Install and configure Sunshine for Moonlight
+        shell: pwsh
+        run: |
+          $installer = Join-Path $env:TEMP 'Sunshine-Windows-AMD64-installer.msi'
+          $url = 'https://github.com/LizardByte/Sunshine/releases/latest/download/Sunshine-Windows-AMD64-installer.msi'
+          Invoke-WebRequest -Uri $url -OutFile $installer
+          $process = Start-Process msiexec.exe -ArgumentList @('/i', $installer, '/qn', '/norestart') -Wait -PassThru
+          if ($process.ExitCode -notin @(0, 3010)) {
+            throw "Sunshine installer failed with exit code $($process.ExitCode)."
+          }
+
+          $tsIp = [string]$env:TAILSCALE_IPV4
+          if ([string]::IsNullOrWhiteSpace($tsIp)) {
+            throw 'Verified Tailscale IPv4 was not passed from the connection verification step; refusing to configure Sunshine.'
+          }
+          $tsIp = $tsIp.Trim()
+          if ($tsIp -notmatch '^\d{1,3}(\.\d{1,3}){3}
+
+          $configDir = Join-Path $env:ProgramFiles 'Sunshine\config'
+          $sunshineConfig = Join-Path $configDir 'sunshine.conf'
+          New-Item -ItemType Directory -Force -Path $configDir | Out-Null
+
+          $configLines = if (Test-Path -LiteralPath $sunshineConfig) {
+            @(Get-Content -LiteralPath $sunshineConfig)
+          } else {
+            @()
+          }
+
+          function Set-SunshineSetting {
+            param([string]$Name, [string]$Value)
+            $pattern = '^\s*' + [regex]::Escape($Name) + '\s*='
+            $index = -1
+            for ($i = 0; $i -lt $script:configLines.Count; $i++) {
+              if ([string]$script:configLines[$i] -match $pattern) {
+                $index = $i
+                break
+              }
+            }
+            $line = "$Name = $Value"
+            if ($index -ge 0) {
+              $script:configLines[$index] = $line
+            } else {
+              $script:configLines += $line
+            }
+          }
+
+          # Sunshine receives the browser Origin with the Web UI port included.
+          # Keep the exact HTTPS origin allowed so the Web UI does not hit CSRF errors.
+          $origin = "https://$tsIp:47990"
+          $csrfIndex = -1
+          for ($i = 0; $i -lt $configLines.Count; $i++) {
+            if ([string]$configLines[$i] -match '^\s*csrf_allowed_origins\s*=') {
+              $csrfIndex = $i
+              break
+            }
+          }
+          if ($csrfIndex -ge 0) {
+            $existingValue = ([string]$configLines[$csrfIndex] -replace '^\s*csrf_allowed_origins\s*=\s*', '')
+            $origins = @($existingValue -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+            if ($origins -notcontains $origin) { $origins += $origin }
+            $configLines[$csrfIndex] = "csrf_allowed_origins = $($origins -join ',')"
+          } else {
+            $configLines += "csrf_allowed_origins = $origin"
+          }
+
+          # Reduce idle/static-screen traffic while retaining a strict stream ceiling.
+          Set-SunshineSetting -Name 'minimum_fps_target' -Value '1'
+          Set-SunshineSetting -Name 'max_bitrate' -Value '750'
+          Set-SunshineSetting -Name 'max_stream_resolution' -Value '854x480'
+
+          Set-Content -LiteralPath $sunshineConfig -Value $configLines -Encoding utf8
+          Write-Host "Configured Sunshine CSRF origin: $origin"
+          Write-Host 'Configured static-content minimum FPS target: 1'
+          Write-Host 'Configured maximum stream bitrate: 750 Kbps'
+          Write-Host 'Configured maximum stream resolution: 854x480'
+
+          $service = Get-Service -Name 'SunshineService' -ErrorAction SilentlyContinue
+          if (-not $service) {
+            $service = Get-Service | Where-Object {
+              $_.Name -like '*Sunshine*' -or $_.DisplayName -like '*Sunshine*'
+            } | Select-Object -First 1
+          }
+          if (-not $service) { throw 'Sunshine was installed, but its Windows service was not found.' }
+
+          Set-Service -Name $service.Name -StartupType Automatic
+          if ($service.Status -eq 'Running') {
+            Restart-Service -Name $service.Name -Force -ErrorAction Stop
+          } else {
+            Start-Service -Name $service.Name -ErrorAction Stop
+          }
+          Start-Sleep -Seconds 3
+          $service = Get-Service -Name $service.Name
+          Write-Host "Sunshine service: $($service.Name) ($($service.Status))"
+          if ($service.Status -ne 'Running') { throw 'Sunshine service did not start.' }
+
+          $tcpPorts = '47984,47989,47990,48010'
+          $udpPorts = '47998-48000,48010'
+          New-NetFirewallRule -DisplayName 'Sunshine TCP via Tailscale' -Direction Inbound -Action Allow -Protocol TCP -LocalPort $tcpPorts -RemoteAddress '100.64.0.0/10' -Profile Any -ErrorAction SilentlyContinue | Out-Null
+          New-NetFirewallRule -DisplayName 'Sunshine UDP via Tailscale' -Direction Inbound -Action Allow -Protocol UDP -LocalPort $udpPorts -RemoteAddress '100.64.0.0/10' -Profile Any -ErrorAction SilentlyContinue | Out-Null
+          Write-Host 'Sunshine firewall access restricted to Tailscale addresses.'
+          Write-Host 'Open https://<current-tailscale-ip>:47990 to create Sunshine credentials and pair Moonlight.'
+
+      - name: Keep desktop session available
+        shell: pwsh
+        run: |
+          Write-Host 'Desktop is ready. The job has a maximum duration of 350 minutes.'
+          while ($true) {
+            Start-Sleep -Seconds 30
+          }
+
+      - name: Package Minecraft and Lunar data for the next run
+        if: always()
+        shell: pwsh
+        run: |
+          $root = $env:USERPROFILE
+          $stage = Join-Path $env:TEMP 'desktop-backup-stage'
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+
+          $paths = @(
+            (Join-Path $root 'AppData\Roaming\.minecraft'),
+            (Join-Path $root '.lunarclient'),
+            (Join-Path $root 'AppData\Roaming\lunarclient')
+          )
+
+          foreach ($source in $paths) {
+            if (Test-Path $source) {
+              $relative = $source.Substring($root.Length).TrimStart('\')
+              $destination = Join-Path $stage $relative
+              New-Item -ItemType Directory -Force -Path (Split-Path $destination) | Out-Null
+              Copy-Item -LiteralPath $source -Destination $destination -Recurse -Force
+            }
+          }
+
+          $zip = Join-Path $env:RUNNER_TEMP 'desktop-backup.zip'
+          if (Test-Path $zip) { Remove-Item $zip -Force }
+          if ((Get-ChildItem $stage -Force | Measure-Object).Count -gt 0) {
+            Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zip -Force
+            New-Item -ItemType Directory -Force -Path (Join-Path $env:RUNNER_TEMP 'desktop-backup') | Out-Null
+            Move-Item -LiteralPath $zip -Destination (Join-Path $env:RUNNER_TEMP 'desktop-backup\desktop-backup.zip') -Force
+          } else {
+            Write-Host 'No Minecraft or Lunar files found to back up.'
+          }
+
+      - name: Save backup artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: minecraft-backup
+          path: ${{ runner.temp }}/desktop-backup/desktop-backup.zip
+          if-no-files-found: ignore
+          retention-days: 30
+) { throw "Tailscale returned an invalid IPv4 address: $ip" }
+          "TAILSCALE_IPV4=$ip" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "Tailscale verified and exported for later steps: $ip"
+
+      - name: Enable secure RDP access
+        shell: pwsh
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+            throw 'RDP_PASSWORD secret is missing.'
+          }
+
+          net user runneradmin $env:RDP_PASSWORD
+          if ($LASTEXITCODE -ne 0) { throw 'Could not set the RDP password.' }
+
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name UserAuthentication -Value 1
+          Set-Service -Name TermService -StartupType Automatic
+          Start-Service -Name TermService
+
+          Get-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue |
+            Set-NetFirewallRule -Enabled True -Profile Any -RemoteAddress '100.64.0.0/10'
+
+          $ipOutput = tailscale ip -4 2>$null
+          if ($LASTEXITCODE -ne 0 -or -not $ipOutput) { throw 'Tailscale is not connected; refusing to continue with RDP setup.' }
+          $ip = ($ipOutput | Select-Object -First 1).ToString().Trim()
+          if (-not $ip) { throw 'Could not determine the Tailscale IPv4 address.' }
+          Write-Host "Tailscale IPv4: $ip"
+          Write-Host 'Connect using your RDP app to the Tailscale IP above, username runneradmin, and your saved RDP_PASSWORD.'
+
+      - name: Install and configure Sunshine for Moonlight
+        shell: pwsh
+        run: |
+          $installer = Join-Path $env:TEMP 'Sunshine-Windows-AMD64-installer.msi'
+          $url = 'https://github.com/LizardByte/Sunshine/releases/latest/download/Sunshine-Windows-AMD64-installer.msi'
+          Invoke-WebRequest -Uri $url -OutFile $installer
+          $process = Start-Process msiexec.exe -ArgumentList @('/i', $installer, '/qn', '/norestart') -Wait -PassThru
+          if ($process.ExitCode -notin @(0, 3010)) {
+            throw "Sunshine installer failed with exit code $($process.ExitCode)."
+          }
+
+          $ipOutput = tailscale ip -4 2>$null
+          if ($LASTEXITCODE -ne 0 -or -not $ipOutput) { throw 'Tailscale is not connected; refusing to configure Sunshine.' }
+          $tsIp = ($ipOutput | Select-Object -First 1).ToString().Trim()
+          if (-not $tsIp) { throw 'Could not determine Tailscale IP for Sunshine configuration.' }
+
+          $configDir = Join-Path $env:ProgramFiles 'Sunshine\config'
+          $sunshineConfig = Join-Path $configDir 'sunshine.conf'
+          New-Item -ItemType Directory -Force -Path $configDir | Out-Null
+
+          $configLines = if (Test-Path -LiteralPath $sunshineConfig) {
+            @(Get-Content -LiteralPath $sunshineConfig)
+          } else {
+            @()
+          }
+
+          function Set-SunshineSetting {
+            param([string]$Name, [string]$Value)
+            $pattern = '^\s*' + [regex]::Escape($Name) + '\s*='
+            $index = -1
+            for ($i = 0; $i -lt $script:configLines.Count; $i++) {
+              if ([string]$script:configLines[$i] -match $pattern) {
+                $index = $i
+                break
+              }
+            }
+            $line = "$Name = $Value"
+            if ($index -ge 0) {
+              $script:configLines[$index] = $line
+            } else {
+              $script:configLines += $line
+            }
+          }
+
+          # Sunshine receives the browser Origin with the Web UI port included.
+          # Keep the exact HTTPS origin allowed so the Web UI does not hit CSRF errors.
+          $origin = "https://$tsIp:47990"
+          $csrfIndex = -1
+          for ($i = 0; $i -lt $configLines.Count; $i++) {
+            if ([string]$configLines[$i] -match '^\s*csrf_allowed_origins\s*=') {
+              $csrfIndex = $i
+              break
+            }
+          }
+          if ($csrfIndex -ge 0) {
+            $existingValue = ([string]$configLines[$csrfIndex] -replace '^\s*csrf_allowed_origins\s*=\s*', '')
+            $origins = @($existingValue -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+            if ($origins -notcontains $origin) { $origins += $origin }
+            $configLines[$csrfIndex] = "csrf_allowed_origins = $($origins -join ',')"
+          } else {
+            $configLines += "csrf_allowed_origins = $origin"
+          }
+
+          # Reduce idle/static-screen traffic while retaining a strict stream ceiling.
+          Set-SunshineSetting -Name 'minimum_fps_target' -Value '1'
+          Set-SunshineSetting -Name 'max_bitrate' -Value '750'
+          Set-SunshineSetting -Name 'max_stream_resolution' -Value '854x480'
+
+          Set-Content -LiteralPath $sunshineConfig -Value $configLines -Encoding utf8
+          Write-Host "Configured Sunshine CSRF origin: $origin"
+          Write-Host 'Configured static-content minimum FPS target: 1'
+          Write-Host 'Configured maximum stream bitrate: 750 Kbps'
+          Write-Host 'Configured maximum stream resolution: 854x480'
+
+          $service = Get-Service -Name 'SunshineService' -ErrorAction SilentlyContinue
+          if (-not $service) {
+            $service = Get-Service | Where-Object {
+              $_.Name -like '*Sunshine*' -or $_.DisplayName -like '*Sunshine*'
+            } | Select-Object -First 1
+          }
+          if (-not $service) { throw 'Sunshine was installed, but its Windows service was not found.' }
+
+          Set-Service -Name $service.Name -StartupType Automatic
+          if ($service.Status -eq 'Running') {
+            Restart-Service -Name $service.Name -Force -ErrorAction Stop
+          } else {
+            Start-Service -Name $service.Name -ErrorAction Stop
+          }
+          Start-Sleep -Seconds 3
+          $service = Get-Service -Name $service.Name
+          Write-Host "Sunshine service: $($service.Name) ($($service.Status))"
+          if ($service.Status -ne 'Running') { throw 'Sunshine service did not start.' }
+
+          $tcpPorts = '47984,47989,47990,48010'
+          $udpPorts = '47998-48000,48010'
+          New-NetFirewallRule -DisplayName 'Sunshine TCP via Tailscale' -Direction Inbound -Action Allow -Protocol TCP -LocalPort $tcpPorts -RemoteAddress '100.64.0.0/10' -Profile Any -ErrorAction SilentlyContinue | Out-Null
+          New-NetFirewallRule -DisplayName 'Sunshine UDP via Tailscale' -Direction Inbound -Action Allow -Protocol UDP -LocalPort $udpPorts -RemoteAddress '100.64.0.0/10' -Profile Any -ErrorAction SilentlyContinue | Out-Null
+          Write-Host 'Sunshine firewall access restricted to Tailscale addresses.'
+          Write-Host 'Open https://<current-tailscale-ip>:47990 to create Sunshine credentials and pair Moonlight.'
+
+      - name: Keep desktop session available
+        shell: pwsh
+        run: |
+          Write-Host 'Desktop is ready. The job has a maximum duration of 350 minutes.'
+          while ($true) {
+            Start-Sleep -Seconds 30
+          }
+
+      - name: Package Minecraft and Lunar data for the next run
+        if: always()
+        shell: pwsh
+        run: |
+          $root = $env:USERPROFILE
+          $stage = Join-Path $env:TEMP 'desktop-backup-stage'
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+
+          $paths = @(
+            (Join-Path $root 'AppData\Roaming\.minecraft'),
+            (Join-Path $root '.lunarclient'),
+            (Join-Path $root 'AppData\Roaming\lunarclient')
+          )
+
+          foreach ($source in $paths) {
+            if (Test-Path $source) {
+              $relative = $source.Substring($root.Length).TrimStart('\')
+              $destination = Join-Path $stage $relative
+              New-Item -ItemType Directory -Force -Path (Split-Path $destination) | Out-Null
+              Copy-Item -LiteralPath $source -Destination $destination -Recurse -Force
+            }
+          }
+
+          $zip = Join-Path $env:RUNNER_TEMP 'desktop-backup.zip'
+          if (Test-Path $zip) { Remove-Item $zip -Force }
+          if ((Get-ChildItem $stage -Force | Measure-Object).Count -gt 0) {
+            Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zip -Force
+            New-Item -ItemType Directory -Force -Path (Join-Path $env:RUNNER_TEMP 'desktop-backup') | Out-Null
+            Move-Item -LiteralPath $zip -Destination (Join-Path $env:RUNNER_TEMP 'desktop-backup\desktop-backup.zip') -Force
+          } else {
+            Write-Host 'No Minecraft or Lunar files found to back up.'
+          }
+
+      - name: Save backup artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: minecraft-backup
+          path: ${{ runner.temp }}/desktop-backup/desktop-backup.zip
+          if-no-files-found: ignore
+          retention-days: 30
+) {
+            throw "The propagated Tailscale IPv4 is invalid: $tsIp"
+          }
+
+          $configDir = Join-Path $env:ProgramFiles 'Sunshine\config'
+          $sunshineConfig = Join-Path $configDir 'sunshine.conf'
+          New-Item -ItemType Directory -Force -Path $configDir | Out-Null
+
+          $configLines = if (Test-Path -LiteralPath $sunshineConfig) {
+            @(Get-Content -LiteralPath $sunshineConfig)
+          } else {
+            @()
+          }
+
+          function Set-SunshineSetting {
+            param([string]$Name, [string]$Value)
+            $pattern = '^\s*' + [regex]::Escape($Name) + '\s*='
+            $index = -1
+            for ($i = 0; $i -lt $script:configLines.Count; $i++) {
+              if ([string]$script:configLines[$i] -match $pattern) {
+                $index = $i
+                break
+              }
+            }
+            $line = "$Name = $Value"
+            if ($index -ge 0) {
+              $script:configLines[$index] = $line
+            } else {
+              $script:configLines += $line
+            }
+          }
+
+          # Sunshine receives the browser Origin with the Web UI port included.
+          # Keep the exact HTTPS origin allowed so the Web UI does not hit CSRF errors.
+          $origin = "https://$tsIp:47990"
+          $csrfIndex = -1
+          for ($i = 0; $i -lt $configLines.Count; $i++) {
+            if ([string]$configLines[$i] -match '^\s*csrf_allowed_origins\s*=') {
+              $csrfIndex = $i
+              break
+            }
+          }
+          if ($csrfIndex -ge 0) {
+            $existingValue = ([string]$configLines[$csrfIndex] -replace '^\s*csrf_allowed_origins\s*=\s*', '')
+            $origins = @($existingValue -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+            if ($origins -notcontains $origin) { $origins += $origin }
+            $configLines[$csrfIndex] = "csrf_allowed_origins = $($origins -join ',')"
+          } else {
+            $configLines += "csrf_allowed_origins = $origin"
+          }
+
+          # Reduce idle/static-screen traffic while retaining a strict stream ceiling.
+          Set-SunshineSetting -Name 'minimum_fps_target' -Value '1'
+          Set-SunshineSetting -Name 'max_bitrate' -Value '750'
+          Set-SunshineSetting -Name 'max_stream_resolution' -Value '854x480'
+
+          Set-Content -LiteralPath $sunshineConfig -Value $configLines -Encoding utf8
+          Write-Host "Configured Sunshine CSRF origin: $origin"
+          Write-Host 'Configured static-content minimum FPS target: 1'
+          Write-Host 'Configured maximum stream bitrate: 750 Kbps'
+          Write-Host 'Configured maximum stream resolution: 854x480'
+
+          $service = Get-Service -Name 'SunshineService' -ErrorAction SilentlyContinue
+          if (-not $service) {
+            $service = Get-Service | Where-Object {
+              $_.Name -like '*Sunshine*' -or $_.DisplayName -like '*Sunshine*'
+            } | Select-Object -First 1
+          }
+          if (-not $service) { throw 'Sunshine was installed, but its Windows service was not found.' }
+
+          Set-Service -Name $service.Name -StartupType Automatic
+          if ($service.Status -eq 'Running') {
+            Restart-Service -Name $service.Name -Force -ErrorAction Stop
+          } else {
+            Start-Service -Name $service.Name -ErrorAction Stop
+          }
+          Start-Sleep -Seconds 3
+          $service = Get-Service -Name $service.Name
+          Write-Host "Sunshine service: $($service.Name) ($($service.Status))"
+          if ($service.Status -ne 'Running') { throw 'Sunshine service did not start.' }
+
+          $tcpPorts = '47984,47989,47990,48010'
+          $udpPorts = '47998-48000,48010'
+          New-NetFirewallRule -DisplayName 'Sunshine TCP via Tailscale' -Direction Inbound -Action Allow -Protocol TCP -LocalPort $tcpPorts -RemoteAddress '100.64.0.0/10' -Profile Any -ErrorAction SilentlyContinue | Out-Null
+          New-NetFirewallRule -DisplayName 'Sunshine UDP via Tailscale' -Direction Inbound -Action Allow -Protocol UDP -LocalPort $udpPorts -RemoteAddress '100.64.0.0/10' -Profile Any -ErrorAction SilentlyContinue | Out-Null
+          Write-Host 'Sunshine firewall access restricted to Tailscale addresses.'
+          Write-Host 'Open https://<current-tailscale-ip>:47990 to create Sunshine credentials and pair Moonlight.'
+
+      - name: Keep desktop session available
+        shell: pwsh
+        run: |
+          Write-Host 'Desktop is ready. The job has a maximum duration of 350 minutes.'
+          while ($true) {
+            Start-Sleep -Seconds 30
+          }
+
+      - name: Package Minecraft and Lunar data for the next run
+        if: always()
+        shell: pwsh
+        run: |
+          $root = $env:USERPROFILE
+          $stage = Join-Path $env:TEMP 'desktop-backup-stage'
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+
+          $paths = @(
+            (Join-Path $root 'AppData\Roaming\.minecraft'),
+            (Join-Path $root '.lunarclient'),
+            (Join-Path $root 'AppData\Roaming\lunarclient')
+          )
+
+          foreach ($source in $paths) {
+            if (Test-Path $source) {
+              $relative = $source.Substring($root.Length).TrimStart('\')
+              $destination = Join-Path $stage $relative
+              New-Item -ItemType Directory -Force -Path (Split-Path $destination) | Out-Null
+              Copy-Item -LiteralPath $source -Destination $destination -Recurse -Force
+            }
+          }
+
+          $zip = Join-Path $env:RUNNER_TEMP 'desktop-backup.zip'
+          if (Test-Path $zip) { Remove-Item $zip -Force }
+          if ((Get-ChildItem $stage -Force | Measure-Object).Count -gt 0) {
+            Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zip -Force
+            New-Item -ItemType Directory -Force -Path (Join-Path $env:RUNNER_TEMP 'desktop-backup') | Out-Null
+            Move-Item -LiteralPath $zip -Destination (Join-Path $env:RUNNER_TEMP 'desktop-backup\desktop-backup.zip') -Force
+          } else {
+            Write-Host 'No Minecraft or Lunar files found to back up.'
+          }
+
+      - name: Save backup artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: minecraft-backup
+          path: ${{ runner.temp }}/desktop-backup/desktop-backup.zip
+          if-no-files-found: ignore
+          retention-days: 30
+) { throw "Tailscale returned an invalid IPv4 address: $ip" }
+          "TAILSCALE_IPV4=$ip" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "Tailscale verified and exported for later steps: $ip"
 
       - name: Enable secure RDP access
         shell: pwsh
