@@ -231,13 +231,15 @@ jobs:
           Write-Host "Deployment utility: $($deploy.FullName)"
 
           # Upstream unattended mode: argument 1 selects core desktop OpenGL.
-          $deployOutput = Join-Path $env:RUNNER_TEMP 'mesa-deployment.log'
+          $deployStdout = Join-Path $env:RUNNER_TEMP 'mesa-deployment.stdout.log'
+          $deployStderr = Join-Path $env:RUNNER_TEMP 'mesa-deployment.stderr.log'
           Push-Location $mesaBin
           try {
-            $process = Start-Process -FilePath $env:ComSpec -ArgumentList @('/d', '/c', "`"$($deploy.FullName)`" 1") -RedirectStandardOutput $deployOutput -RedirectStandardError $deployOutput -NoNewWindow -Wait -PassThru
-            if ($process.ExitCode -ne 0) { if (Test-Path $deployOutput) { Get-Content $deployOutput | Write-Host }; throw "Mesa deployment utility returned exit code $($process.ExitCode)." }
+            $process = Start-Process -FilePath $env:ComSpec -ArgumentList @('/d', '/c', "`"$($deploy.FullName)`" 1") -RedirectStandardOutput $deployStdout -RedirectStandardError $deployStderr -NoNewWindow -Wait -PassThru
+            if ($process.ExitCode -ne 0) { if (Test-Path $deployStdout) { Get-Content $deployStdout | Write-Host }; if (Test-Path $deployStderr) { Get-Content $deployStderr | Write-Host }; throw "Mesa deployment utility returned exit code $($process.ExitCode)." }
           } finally { Pop-Location }
-          if (Test-Path $deployOutput) { Get-Content $deployOutput | Write-Host }
+          if (Test-Path $deployStdout) { Get-Content $deployStdout | Write-Host }
+          if (Test-Path $deployStderr) { Get-Content $deployStderr | Write-Host }
 
           # Verify the actual system driver and Windows OpenGL registration.
           $driver = Join-Path $env:WINDIR 'System32\mesadrv.dll'
