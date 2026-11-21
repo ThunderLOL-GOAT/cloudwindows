@@ -189,6 +189,50 @@ jobs:
           Write-Host 'Sunshine firewall access restricted to Tailscale addresses.'
           Write-Host 'Open https://<current-tailscale-ip>:47990 to create Sunshine credentials and pair Moonlight.'
 
+      - name: Install Mesa OpenGL for cloud Minecraft
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $release = Invoke-RestMethod -Uri 'https://api.github.com/repos/pal1000/mesa-dist-win/releases/latest'
+          $assetName = "mesa3d-$($release.tag_name)-release-msvc.7z"
+          $asset = $release.assets | Where-Object { $_.name -eq $assetName } | Select-Object -First 1
+          if (-not $asset) { throw "Could not find Mesa MSVC x64 release asset: $assetName" }
+
+          $mesaRoot = Join-Path $env:RUNNER_TEMP 'mesa'
+          $archive = Join-Path $env:RUNNER_TEMP $assetName
+          New-Item -ItemType Directory -Force -Path $mesaRoot | Out-Null
+          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $archive
+
+          $sevenZip = (Get-Command 7z.exe -ErrorAction Stop).Source
+          & $sevenZip x $archive "-o$mesaRoot" -y
+          if ($LASTEXITCODE -ne 0) { throw "7-Zip extraction failed with exit code $LASTEXITCODE." }
+
+          $deploy = Get-ChildItem -Path $mesaRoot -Filter 'systemwidedeploy.cmd' -Recurse -File |
+            Select-Object -First 1
+          if (-not $deploy) { throw 'Mesa archive extracted, but systemwidedeploy.cmd was not found.' }
+
+          Write-Host "Mesa release: $($release.tag_name)"
+          Write-Host "Deployment script: $($deploy.FullName)"
+          Push-Location $deploy.DirectoryName
+          try {
+            & $deploy.FullName 1
+            if ($LASTEXITCODE -ne 0) { throw "Mesa deployment failed with exit code $LASTEXITCODE." }
+          } finally {
+            Pop-Location
+          }
+
+          $mesaDriver = Join-Path $env:WINDIR 'System32\mesadrv.dll'
+          if (-not (Test-Path -LiteralPath $mesaDriver)) {
+            throw 'Mesa deployment finished without the expected System32 Mesa driver.'
+          }
+
+          # Ask Mesa's D3D12 Gallium driver to use Windows WARP when Minecraft
+          # starts. This is software rendering, not a physical GPU.
+          [Environment]::SetEnvironmentVariable('GALLIUM_DRIVER', 'd3d12', 'Machine')
+          [Environment]::SetEnvironmentVariable('LIBGL_ALWAYS_SOFTWARE', '1', 'Machine')
+          Write-Host 'Mesa desktop OpenGL deployed. D3D12/WARP selected for future app launches.'
+          Write-Host 'Minecraft must be restarted after this step to inherit the Mesa settings.'
+
       - name: Keep desktop session available
         shell: pwsh
         run: |
