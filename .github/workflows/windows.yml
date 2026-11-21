@@ -189,85 +189,68 @@ jobs:
           Write-Host 'Sunshine firewall access restricted to Tailscale addresses.'
           Write-Host 'Open https://<current-tailscale-ip>:47990 to create Sunshine credentials and pair Moonlight.'
 
-      - name: Install Mesa OpenGL for cloud Minecraft
+      - name: Install and deploy Mesa OpenGL automatically
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
 
-          # Resolve the current MSVC x64 release asset by suffix instead of
-          # guessing a versioned filename.
-          $release = Invoke-RestMethod -Uri 'https://api.github.com/repos/pal1000/mesa-dist-win/releases/latest'
-          $asset = $release.assets |
-            Where-Object { $_.name -match '-release-msvc\.7z$' } |
-            Select-Object -First 1
-          if (-not $asset) {
-            throw "No MSVC x64 7z asset was published for Mesa release $($release.tag_name)."
-          }
+          # Resolve the current 64-bit MSVC release asset.
+          $headers = @{ 'User-Agent' = 'ThunderLOL-cloudwindows-setup' }
+          $release = Invoke-RestMethod -Uri 'https://api.github.com/repos/pal1000/mesa-dist-win/releases/latest' -Headers $headers
+          $asset = $release.assets | Where-Object { $_.name -match '-release-msvc\.7z$' } | Sort-Object size -Descending | Select-Object -First 1
+          if (-not $asset -or -not $asset.browser_download_url) { throw "No x64 MSVC Mesa .7z release asset found for $($release.tag_name)." }
 
-          # Keep the extracted package in a predictable location so it can be
-          # inspected and reused during this VM session.
           $mesaRoot = 'C:\Mesa'
           $archive = Join-Path $env:RUNNER_TEMP $asset.name
-          if (Test-Path -LiteralPath $mesaRoot) {
-            Remove-Item -LiteralPath $mesaRoot -Recurse -Force
-          }
+          $sevenZip = Join-Path $env:RUNNER_TEMP '7zr.exe'
+
+          # Use the official standalone 7-Zip console extractor; do not assume it is preinstalled.
+          Invoke-WebRequest -Uri 'https://www.7-zip.org/a/7zr.exe' -OutFile $sevenZip -Headers $headers
+          if (-not (Test-Path -LiteralPath $sevenZip) -or (Get-Item $sevenZip).Length -lt 100000) { throw 'The standalone 7-Zip extractor download is missing or unexpectedly small.' }
+
+          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $archive -Headers $headers
+          if (-not (Test-Path -LiteralPath $archive) -or (Get-Item $archive).Length -lt 1000000) { throw 'The Mesa archive download is missing or unexpectedly small.' }
+          & $sevenZip t $archive
+          if ($LASTEXITCODE -ne 0) { throw "Mesa archive integrity test failed (7-Zip exit $LASTEXITCODE)." }
+
+          if (Test-Path -LiteralPath $mesaRoot) { Remove-Item -LiteralPath $mesaRoot -Recurse -Force }
           New-Item -ItemType Directory -Force -Path $mesaRoot | Out-Null
-          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $archive
-
-          $sevenZipCommand = Get-Command '7z.exe' -ErrorAction SilentlyContinue
-          if ($sevenZipCommand) {
-            $sevenZip = $sevenZipCommand.Source
-          } else {
-            $sevenZip = Join-Path $env:ProgramFiles '7-Zip\7z.exe'
-            if (-not (Test-Path -LiteralPath $sevenZip)) {
-              throw '7-Zip was not found on the GitHub Windows runner.'
-            }
-          }
-
           & $sevenZip x $archive "-o$mesaRoot" -y
-          if ($LASTEXITCODE -ne 0) {
-            throw "Mesa archive extraction failed with exit code $LASTEXITCODE."
-          }
+          if ($LASTEXITCODE -ne 0) { throw "Mesa extraction failed (7-Zip exit $LASTEXITCODE)." }
 
-          $deploy = Get-ChildItem -LiteralPath $mesaRoot -Filter 'systemwidedeploy.cmd' -Recurse -File |
-            Select-Object -First 1
-          if (-not $deploy) {
-            throw "Mesa $($release.tag_name) extracted, but systemwidedeploy.cmd was not found under $mesaRoot."
-          }
+          $deploy = Get-ChildItem -LiteralPath $mesaRoot -Filter 'systemwidedeploy.cmd' -Recurse -File | Select-Object -First 1
+          if (-not $deploy) { throw "Mesa $($release.tag_name) extracted, but systemwidedeploy.cmd was not found." }
+          $mesaBin = $deploy.DirectoryName
+          $x64OpenGl = Join-Path $mesaBin 'x64\opengl32.dll'
+          $x64Gallium = Join-Path $mesaBin 'x64\libgallium_wgl.dll'
+          if (-not (Test-Path $x64OpenGl) -and -not (Test-Path $x64Gallium)) { throw 'The downloaded Mesa package has no x64 desktop OpenGL driver.' }
 
           Write-Host "Mesa release: $($release.tag_name)"
-          Write-Host "Extracted to: $mesaRoot"
+          Write-Host "Mesa extracted to: $mesaRoot"
           Write-Host "Deployment utility: $($deploy.FullName)"
 
-          # Choice 1 installs Mesa's system-wide desktop OpenGL driver. This
-          # deployment mode is specifically documented for cloud VMs/RDP.
-          Push-Location $deploy.DirectoryName
+          # Upstream unattended mode: argument 1 selects core desktop OpenGL.
+          $deployOutput = Join-Path $env:RUNNER_TEMP 'mesa-deployment.log'
+          Push-Location $mesaBin
           try {
-            & $deploy.FullName 1
-            if ($LASTEXITCODE -ne 0) {
-              throw "Mesa system-wide deployment failed with exit code $LASTEXITCODE."
-            }
-          } finally {
-            Pop-Location
-          }
+            $process = Start-Process -FilePath $env:ComSpec -ArgumentList @('/d', '/c', "`"$($deploy.FullName)`" 1") -RedirectStandardOutput $deployOutput -RedirectStandardError $deployOutput -NoNewWindow -Wait -PassThru
+            if ($process.ExitCode -ne 0) { if (Test-Path $deployOutput) { Get-Content $deployOutput | Write-Host }; throw "Mesa deployment utility returned exit code $($process.ExitCode)." }
+          } finally { Pop-Location }
+          if (Test-Path $deployOutput) { Get-Content $deployOutput | Write-Host }
 
-          $mesaDriver = Join-Path $env:WINDIR 'System32\mesadrv.dll'
-          if (-not (Test-Path -LiteralPath $mesaDriver)) {
-            throw "Mesa deployment did not create the expected driver: $mesaDriver"
-          }
-
-          # Request GLonD3D12 through Windows' built-in D3D12 WARP software
-          # adapter. This is software rendering, not a physical GPU.
-          [Environment]::SetEnvironmentVariable('GALLIUM_DRIVER', 'd3d12', 'Machine')
-          [Environment]::SetEnvironmentVariable('LIBGL_ALWAYS_SOFTWARE', '1', 'Machine')
-          $env:GALLIUM_DRIVER = 'd3d12'
-          $env:LIBGL_ALWAYS_SOFTWARE = '1'
-
-          Write-Host "Mesa driver installed: $mesaDriver"
-          Write-Host "Driver size: $((Get-Item -LiteralPath $mesaDriver).Length) bytes"
-          Write-Host 'Mesa desktop OpenGL deployment completed.'
-          Write-Host 'GLonD3D12/WARP requested for newly launched Minecraft processes.'
-          Write-Host 'Minecraft must be launched after this step to inherit the Mesa settings.'
+          # Verify the actual system driver and Windows OpenGL registration.
+          $driver = Join-Path $env:WINDIR 'System32\mesadrv.dll'
+          $registryPath = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\OpenGLDrivers\MSOGL'
+          if (-not (Test-Path -LiteralPath $driver)) { throw "Mesa deployment did not install the x64 system driver: $driver" }
+          if (-not (Test-Path -LiteralPath $registryPath)) { throw 'Mesa deployment did not create the Windows OpenGL driver registry key.' }
+          $registration = Get-ItemProperty -LiteralPath $registryPath -ErrorAction Stop
+          if ($registration.DLL -ne 'mesadrv.dll') { throw "Windows OpenGL driver registration is incorrect (DLL='$($registration.DLL)')." }
+          $driverInfo = Get-Item -LiteralPath $driver
+          Write-Host "Verified x64 Mesa driver: $($driverInfo.FullName) ($($driverInfo.Length) bytes)"
+          Write-Host "Verified Windows OpenGL registration: $($registration.DLL)"
+          Write-Host 'Mesa system-wide desktop OpenGL deployment completed successfully.'
+          Write-Host 'No global GALLIUM_DRIVER override was set; Mesa selects its available renderer at runtime.'
 
       - name: Keep desktop session available
         shell: pwsh
