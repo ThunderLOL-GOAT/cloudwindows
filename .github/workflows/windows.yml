@@ -193,45 +193,81 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $release = Invoke-RestMethod -Uri 'https://api.github.com/repos/pal1000/mesa-dist-win/releases/latest'
-          $assetName = "mesa3d-$($release.tag_name)-release-msvc.7z"
-          $asset = $release.assets | Where-Object { $_.name -eq $assetName } | Select-Object -First 1
-          if (-not $asset) { throw "Could not find Mesa MSVC x64 release asset: $assetName" }
 
-          $mesaRoot = Join-Path $env:RUNNER_TEMP 'mesa'
-          $archive = Join-Path $env:RUNNER_TEMP $assetName
+          # Resolve the current MSVC x64 release asset by suffix instead of
+          # guessing a versioned filename.
+          $release = Invoke-RestMethod -Uri 'https://api.github.com/repos/pal1000/mesa-dist-win/releases/latest'
+          $asset = $release.assets |
+            Where-Object { $_.name -match '-release-msvc\.7z$' } |
+            Select-Object -First 1
+          if (-not $asset) {
+            throw "No MSVC x64 7z asset was published for Mesa release $($release.tag_name)."
+          }
+
+          # Keep the extracted package in a predictable location so it can be
+          # inspected and reused during this VM session.
+          $mesaRoot = 'C:\Mesa'
+          $archive = Join-Path $env:RUNNER_TEMP $asset.name
+          if (Test-Path -LiteralPath $mesaRoot) {
+            Remove-Item -LiteralPath $mesaRoot -Recurse -Force
+          }
           New-Item -ItemType Directory -Force -Path $mesaRoot | Out-Null
           Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $archive
 
-          $sevenZip = (Get-Command 7z.exe -ErrorAction Stop).Source
-          & $sevenZip x $archive "-o$mesaRoot" -y
-          if ($LASTEXITCODE -ne 0) { throw "7-Zip extraction failed with exit code $LASTEXITCODE." }
+          $sevenZipCommand = Get-Command '7z.exe' -ErrorAction SilentlyContinue
+          if ($sevenZipCommand) {
+            $sevenZip = $sevenZipCommand.Source
+          } else {
+            $sevenZip = Join-Path $env:ProgramFiles '7-Zip\7z.exe'
+            if (-not (Test-Path -LiteralPath $sevenZip)) {
+              throw '7-Zip was not found on the GitHub Windows runner.'
+            }
+          }
 
-          $deploy = Get-ChildItem -Path $mesaRoot -Filter 'systemwidedeploy.cmd' -Recurse -File |
+          & $sevenZip x $archive "-o$mesaRoot" -y
+          if ($LASTEXITCODE -ne 0) {
+            throw "Mesa archive extraction failed with exit code $LASTEXITCODE."
+          }
+
+          $deploy = Get-ChildItem -LiteralPath $mesaRoot -Filter 'systemwidedeploy.cmd' -Recurse -File |
             Select-Object -First 1
-          if (-not $deploy) { throw 'Mesa archive extracted, but systemwidedeploy.cmd was not found.' }
+          if (-not $deploy) {
+            throw "Mesa $($release.tag_name) extracted, but systemwidedeploy.cmd was not found under $mesaRoot."
+          }
 
           Write-Host "Mesa release: $($release.tag_name)"
-          Write-Host "Deployment script: $($deploy.FullName)"
+          Write-Host "Extracted to: $mesaRoot"
+          Write-Host "Deployment utility: $($deploy.FullName)"
+
+          # Choice 1 installs Mesa's system-wide desktop OpenGL driver. This
+          # deployment mode is specifically documented for cloud VMs/RDP.
           Push-Location $deploy.DirectoryName
           try {
             & $deploy.FullName 1
-            if ($LASTEXITCODE -ne 0) { throw "Mesa deployment failed with exit code $LASTEXITCODE." }
+            if ($LASTEXITCODE -ne 0) {
+              throw "Mesa system-wide deployment failed with exit code $LASTEXITCODE."
+            }
           } finally {
             Pop-Location
           }
 
           $mesaDriver = Join-Path $env:WINDIR 'System32\mesadrv.dll'
           if (-not (Test-Path -LiteralPath $mesaDriver)) {
-            throw 'Mesa deployment finished without the expected System32 Mesa driver.'
+            throw "Mesa deployment did not create the expected driver: $mesaDriver"
           }
 
-          # Ask Mesa's D3D12 Gallium driver to use Windows WARP when Minecraft
-          # starts. This is software rendering, not a physical GPU.
+          # Request GLonD3D12 through Windows' built-in D3D12 WARP software
+          # adapter. This is software rendering, not a physical GPU.
           [Environment]::SetEnvironmentVariable('GALLIUM_DRIVER', 'd3d12', 'Machine')
           [Environment]::SetEnvironmentVariable('LIBGL_ALWAYS_SOFTWARE', '1', 'Machine')
-          Write-Host 'Mesa desktop OpenGL deployed. D3D12/WARP selected for future app launches.'
-          Write-Host 'Minecraft must be restarted after this step to inherit the Mesa settings.'
+          $env:GALLIUM_DRIVER = 'd3d12'
+          $env:LIBGL_ALWAYS_SOFTWARE = '1'
+
+          Write-Host "Mesa driver installed: $mesaDriver"
+          Write-Host "Driver size: $((Get-Item -LiteralPath $mesaDriver).Length) bytes"
+          Write-Host 'Mesa desktop OpenGL deployment completed.'
+          Write-Host 'GLonD3D12/WARP requested for newly launched Minecraft processes.'
+          Write-Host 'Minecraft must be launched after this step to inherit the Mesa settings.'
 
       - name: Keep desktop session available
         shell: pwsh
