@@ -37,9 +37,12 @@ if ! pgrep -x tailscaled >/dev/null 2>&1; then
   for _ in $(seq 1 20); do [[ -S /var/run/tailscale/tailscaled.sock ]] && break; sleep 1; done
 fi
 if [[ -n "${TAILSCALE_AUTHKEY:-}" ]]; then
-  tailscale --socket=/var/run/tailscale/tailscaled.sock up --authkey="${TAILSCALE_AUTHKEY}" --hostname=thunder-linux-codespace --accept-dns=false
-  tailscale --socket=/var/run/tailscale/tailscaled.sock serve --bg --tcp=3389 tcp://127.0.0.1:3389
-  tailscale --socket=/var/run/tailscale/tailscaled.sock ip -4 || true
+  if tailscale --socket=/var/run/tailscale/tailscaled.sock up --authkey="${TAILSCALE_AUTHKEY}" --hostname=thunder-linux-codespace --accept-dns=false; then
+    tailscale --socket=/var/run/tailscale/tailscaled.sock serve --bg --tcp=3389 tcp://127.0.0.1:3389 || echo "Tailscale Serve could not publish RDP; check tailnet policy and Serve permissions."
+    tailscale --socket=/var/run/tailscale/tailscaled.sock ip -4 || true
+  else
+    echo "Tailscale authentication failed; local desktop startup will continue."
+  fi
 else
   echo "Tailscale installed but unauthenticated; set TAILSCALE_AUTHKEY as a Codespaces secret for direct private RDP."
 fi
@@ -58,6 +61,7 @@ dbus-daemon --system --fork || true
 service xrdp-sesman start || true
 service xrdp start || true
 sleep 1
+if ! pgrep -x xrdp-sesman >/dev/null 2>&1; then /usr/sbin/xrdp-sesman --nodaemon >/var/log/xrdp-sesman.log 2>&1 & fi
 if ! pgrep -x xrdp >/dev/null 2>&1; then /usr/sbin/xrdp --nodaemon >/var/log/xrdp.log 2>&1 & fi
 echo "XRDP startup requested on TCP 3389."
 STARTUP
