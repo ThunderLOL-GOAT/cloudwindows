@@ -5,7 +5,7 @@
   "forwardPorts": [3389],
   "portsAttributes": {"3389": {"label": "ThunderRemote RDP (private)", "visibility": "private", "onAutoForward": "notify"}},
   "postCreateCommand": "sudo bash .devcontainer/setup.sh",
-  "postStartCommand": "sudo /usr/local/bin/thunder-start-desktop",
+  "postStartCommand": "sudo env TAILSCALE_AUTHKEY=${TAILSCALE_AUTHKEY:-} XRDP_PASSWORD=${XRDP_PASSWORD:-} /usr/local/bin/thunder-start-desktop",
   "remoteUser": "vscode",
   "containerEnv": {"DISPLAY": ":10"}
 }
