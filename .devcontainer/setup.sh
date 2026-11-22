@@ -33,11 +33,12 @@ cat >/usr/local/bin/thunder-start-desktop <<'STARTUP'
 set -euo pipefail
 if ! pgrep -x tailscaled >/dev/null 2>&1; then
   mkdir -p /var/run/tailscale
-  tailscaled --state=/var/lib/tailscale/tailscaled.state --socket=/var/run/tailscale/tailscaled.sock >/var/log/tailscaled.log 2>&1 &
+  tailscaled --tun=userspace-networking --state=/var/lib/tailscale/tailscaled.state --socket=/var/run/tailscale/tailscaled.sock >/var/log/tailscaled.log 2>&1 &
   for _ in $(seq 1 20); do [[ -S /var/run/tailscale/tailscaled.sock ]] && break; sleep 1; done
 fi
 if [[ -n "${TAILSCALE_AUTHKEY:-}" ]]; then
   tailscale --socket=/var/run/tailscale/tailscaled.sock up --authkey="${TAILSCALE_AUTHKEY}" --hostname=thunder-linux-codespace --accept-dns=false
+  tailscale --socket=/var/run/tailscale/tailscaled.sock serve --bg --tcp=3389 tcp://127.0.0.1:3389
   tailscale --socket=/var/run/tailscale/tailscaled.sock ip -4 || true
 else
   echo "Tailscale installed but unauthenticated; set TAILSCALE_AUTHKEY as a Codespaces secret for direct private RDP."
@@ -45,7 +46,7 @@ fi
 if [[ -n "${XRDP_PASSWORD:-}" ]]; then
   printf 'vscode:%s\n' "$XRDP_PASSWORD" | chpasswd
 elif [[ ! -s /home/vscode/.xrdp-password ]]; then
-  password="$(openssl rand -base64 24 | tr -dc 'A-Za-z0-9' | head -c 20)"
+  password="$(openssl rand -hex 10)"
   printf 'vscode:%s\n' "$password" | chpasswd
   install -o vscode -g vscode -m 0600 /dev/null /home/vscode/.xrdp-password
   printf '%s\n' "$password" >/home/vscode/.xrdp-password
