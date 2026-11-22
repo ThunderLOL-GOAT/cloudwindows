@@ -12,7 +12,7 @@ This branch configures a Linux desktop inside GitHub Codespaces.
 
 Port `3389` is forwarded as private. GitHub's forwarded-port URL is an HTTPS web proxy, not a raw RDP endpoint, so do not enter that URL into an RDP client.
 
-For direct ThunderRemote access, add a Tailscale auth key as a **Codespaces secret** named `TAILSCALE_AUTHKEY`, then restart the Codespace. It joins your tailnet as `thunder-linux-codespace`. Connect ThunderRemote to the machine's Tailscale IPv4 address on port `3389`.
+For direct ThunderRemote access, add a Tailscale auth key as a **Codespaces secret** named `TAILSCALE_AUTHKEY`, then restart the Codespace. The daemon uses Tailscale userspace networking (so it does not require `/dev/net/tun`) and publishes a private raw-TCP Serve forwarder from tailnet port `3389` to the local XRDP service. It joins your tailnet as `thunder-linux-codespace`. Connect ThunderRemote to the machine's Tailscale IPv4 address on port `3389`.
 
 Keep port 3389 private and never paste the Tailscale key into chat. The RDP username is `vscode`. If you do not set an `XRDP_PASSWORD` Codespaces secret, a random password is saved in `/home/vscode/.xrdp-password`; read it in the Codespace terminal with:
 
